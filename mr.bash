@@ -321,10 +321,11 @@ __
 #   $4: repository, optional
 #   $5: runner registration token, optional
 #   $6: count of runners, optional, defaults to 0 (all)
-#   $7: extra options for `config.sh`, optional, such as `--local`
+#   $7: graceful, optional, defaults to false
+#   $8: extra options for `config.sh`, optional, such as `--local`
 #   $?: 0 if successful and non-zero otherwise
 function mr::delRunner {
-    local user="$1" enterprise="$2" org="$3" repo="$4" token="$5" opts="$7"
+    local user="$1" enterprise="$2" org="$3" repo="$4" token="$5" graceful="$7" opts="$8"
     local -i count="${6:-0}"
 
     local -a removals=()
@@ -344,6 +345,63 @@ function mr::delRunner {
                 removals+=("$each")
             fi
         done <<<"$existing"
+    fi
+
+
+    if [[ "$graceful" == "true" ]]; then
+        str::anyVarNotEmpty MR_GITHUB_PAT || return $?
+        for user in "${removals[@]}"; do
+            log::_ INFO "Gracefully deleting runner in local user '$user'"
+
+            user_runner_name="$(run::logFailed sudo -Hiu "$user" -- cat runner/mr.d/name)"
+            user_org="$(run::logFailed sudo -Hiu "$user" -- cat runner/mr.d/org)"
+
+            runner_id="$(run::logFailed curl -Lsm 3 --retry 1 \
+                -H "Authorization: Bearer ${MR_GITHUB_PAT}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "$MR_GITHUB_API_BASEURL/orgs/$user_org/actions/runners?name=$user_runner_name" | jq -Mcre '.runners[0].id')"
+
+            run::logFailed sudo -Hiu "$user" -- bash -c "echo $runner_id > runner/mr.d/runner_id"
+
+            log::_ INFO "Deleting all labels of runner $runner_id in local user '$user'"
+            response="$(run::logFailed curl -Lsm 3 --retry 1 \
+                -X DELETE \
+                -H "Authorization: Bearer ${MR_GITHUB_PAT}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "$MR_GITHUB_API_BASEURL/orgs/$user_org/actions/runners/$runner_id/labels")"
+        done
+
+        TIMEOUT=3600
+        while ((TIMEOUT > 0)); do
+            one_runner_busy=false
+            for user in "${removals[@]}"; do
+                user_runner_name="$(run::logFailed sudo -Hiu "$user" -- cat runner/mr.d/name)"
+                user_org="$(run::logFailed sudo -Hiu "$user" -- cat runner/mr.d/org)"
+                runner_id="$(run::logFailed sudo -Hiu "$user" -- cat runner/mr.d/runner_id)"
+                runner_busy="$(run::logFailed curl -Lsm 3 --retry 1 \
+                    -H "Authorization: Bearer ${MR_GITHUB_PAT}" \
+                    -H "Accept: application/vnd.github+json" \
+                    -H "X-GitHub-Api-Version: 2022-11-28" \
+                    "$MR_GITHUB_API_BASEURL/orgs/$user_org/actions/runners/$runner_id" | jq -Mcre '.busy')"
+                if [[ "$runner_busy" == "true" ]]; then
+                    log::_ INFO "Runner $runner_id / $user_runner_name is busy"
+                    one_runner_busy=true
+                    break
+                fi
+            done
+            if [[ "$one_runner_busy" == "false" ]]; then
+                break
+            fi
+            log::_ INFO "At least one runner is still busy, waiting for it to be idle (sleeping 10s)..."
+            sleep 10
+            ((TIMEOUT -= 10))
+        done
+        if ((TIMEOUT <= 0)); then
+            log::_ ERROR "Timeout waiting for runners to be idle"
+            return 1
+        fi
     fi
 
     for user in "${removals[@]}"; do
@@ -424,6 +482,7 @@ Options:
   --token       Runner registration token, takes precedence over MR_GITHUB_PAT
   --dotenv      The lines to set in runner's '.env' files
   --count       The number to add or del, optional, defaults to 1 for add and all for del
+  --graceful    Remove all labels of the runner, and wait for it to be idle. Blocking. (default: false)
   --opts        Extra options for 'config.sh', optional, such as '--no-default-labels'
   -h --help     Show this help.
 "
@@ -433,10 +492,10 @@ declare -rg HELP
 #   $?: 0 if successful and non-zero otherwise
 function mr::main {
     local getopt_output='' subCmd=''
-    local org='' repo='' user='' labels='' token='' group='' dotenv='' count='' opts=''
+    local org='' repo='' user='' labels='' token='' group='' dotenv='' count='' graceful='false' opts=''
 
     # parse options into variables
-    getopt_output="$(getopt -o h -l help,enterprise:,org:,repo:,user:,labels:,token:,group:,dotenv:,count:,opts: -n "$FILE_THIS" -- "$@")"
+    getopt_output="$(getopt -o h -l help,enterprise:,org:,repo:,user:,labels:,token:,group:,dotenv:,count:,graceful:,opts: -n "$FILE_THIS" -- "$@")"
     log::failed $? "getopt failed!" || return $?
     eval set -- "$getopt_output"
 
@@ -479,6 +538,10 @@ function mr::main {
                 count="$2"
                 shift 2
                 ;;
+            --graceful)
+                graceful="$2"
+                shift 2
+                ;;
             --opts)
                 opts="$2"
                 shift 2
@@ -499,7 +562,7 @@ function mr::main {
     shift
     case "$subCmd" in
         add) mr::addRunner "$user" "$enterprise" "$org" "$repo" "$token" "$labels" "$group" "$dotenv" "$count" "$opts" ;;
-        del) mr::delRunner "$user" "$enterprise" "$org" "$repo" "$token" "$count" "$opts" ;;
+        del) mr::delRunner "$user" "$enterprise" "$org" "$repo" "$token" "$count" "$graceful" "$opts" ;;
         list) mr::listRunners ;;
         status) mr::statusRunner "$user" ;;
         download) mr::downloadRunner ;;
